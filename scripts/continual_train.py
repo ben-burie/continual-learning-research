@@ -16,11 +16,7 @@ from src.model.checkpoint import load_checkpoint, save_checkpoint
 from src.model.classifier import WhisperCommandClassifier
 from src.training.dataset import CommandDataset
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
 
 AVAILABLE_ACTIONS = ["open_url", "open_url_in_browser", "open_application"]
