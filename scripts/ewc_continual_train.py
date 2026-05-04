@@ -173,6 +173,17 @@ def train_ewc(model: WhisperCommandClassifier, train_loader, val_loader, device:
             )
             logger.info("  → Best checkpoint saved (val_acc=%.1f%%)", v_acc)
 
+    p = Path(checkpoint_path)
+    le_path = str(p.with_name(f"{p.stem}_LE{p.suffix}"))
+    save_checkpoint(
+        le_path, model, label_to_idx, idx_to_label,
+        whisper_model_name, freeze_encoder=True,
+        val_acc=v_acc, epoch=epochs,
+        fisher={k: v.cpu() for k, v in fisher_d.items()},
+        theta_star={k: v.cpu() for k, v in theta_star_d.items()},
+    )
+    logger.info("  → Last-epoch checkpoint saved → %s (val_acc=%.1f%%)", le_path, v_acc)
+
     logger.info("Training complete. Best val accuracy: %.1f%%", best_val_acc)
 
 # ---------------------------------------------------------------------------

@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_PATH = "models/BASE.pth"
 N_SAMPLES = 150
 BATCH_SIZE = 8
-LR = 1e-4
+LR = 1e-5
 
 
 # ---------------------------------------------------------------------------

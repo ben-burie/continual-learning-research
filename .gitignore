@@ -1,2 +1,4 @@
 *.md
 *__pycache__
+*.pth
+*.wav
