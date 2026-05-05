@@ -77,12 +77,6 @@ def run_data_generation(new_label: str, data_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def expand_classifier(old_model: WhisperCommandClassifier, whisper_model_name: str, n_total: int, device: torch.device) -> WhisperCommandClassifier:
-    """
-    Build a new n_total-class model.
-    - Encoder weights copied from old_model (stays frozen).
-    - Head rows 0..n_old-1 copied from old head.
-    - New row (n_old) is randomly initialized by default.
-    """
     new_model = WhisperCommandClassifier(whisper_model_name, n_total, freeze_encoder=True)
     new_model.encoder.load_state_dict(old_model.encoder.state_dict())
 
@@ -100,7 +94,6 @@ def expand_classifier(old_model: WhisperCommandClassifier, whisper_model_name: s
 # ---------------------------------------------------------------------------
 
 def collect_files(new_label: str, data_dir: Path) -> tuple[list[str], list[str]]:
-    """Returns (file_paths, labels) for all .wav files in data_dir/new_label."""
     new_dir = data_dir / new_label
     if not new_dir.exists():
         logger.error("New command data dir not found: %s", new_dir)
@@ -131,14 +124,6 @@ def build_dataloaders(file_paths: list[str], labels: list[str], label_to_idx: di
 def train_continual(model: WhisperCommandClassifier, train_loader: DataLoader, val_loader: DataLoader, device: torch.device,
     epochs: int, n_old: int, checkpoint_path: str, label_to_idx: dict, idx_to_label: dict, whisper_model_name: str,
     grad_update_prob: float, freeze_encoder: bool = True) -> None:
-    """
-    Standard train/val loop.
-
-    grad_update_prob controls how often old head rows are allowed to update:
-      0.0 — always zero old rows (hard freeze)
-      1.0 — never zero old rows (full plasticity)
-      0 < p < 1 — per batch, zero old rows with probability (1 - p)
-    """
     optimizer = torch.optim.AdamW(
         [model.classifier.weight, model.classifier.bias], lr=LR
     )
