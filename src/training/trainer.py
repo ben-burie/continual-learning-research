@@ -14,9 +14,10 @@ _FISHER_MAX_BATCHES = 100
 def compute_fisher_diagonal(model, train_loader, device) -> tuple[dict, dict]:
     """Compute diagonal Fisher Information Matrix over the classifier head."""
     model.eval()
+    out_layer = model.output_layer
     fisher = {
-        "weight": torch.zeros_like(model.classifier.weight),
-        "bias":   torch.zeros_like(model.classifier.bias),
+        "weight": torch.zeros_like(out_layer.weight),
+        "bias":   torch.zeros_like(out_layer.bias),
     }
 
     n_batches = 0
@@ -26,8 +27,8 @@ def compute_fisher_diagonal(model, train_loader, device) -> tuple[dict, dict]:
         mels     = mels.to(device)
         n_frames = n_frames.to(device)
 
-        model.classifier.weight.grad = None
-        model.classifier.bias.grad   = None
+        out_layer.weight.grad = None
+        out_layer.bias.grad   = None
 
         logits    = model(mels, n_frames)
         log_probs = F.log_softmax(logits, dim=1)
@@ -35,25 +36,25 @@ def compute_fisher_diagonal(model, train_loader, device) -> tuple[dict, dict]:
         loss      = F.nll_loss(log_probs, predicted)
         loss.backward()
 
-        fisher["weight"] += model.classifier.weight.grad ** 2
-        fisher["bias"]   += model.classifier.bias.grad   ** 2
+        fisher["weight"] += out_layer.weight.grad ** 2
+        fisher["bias"]   += out_layer.bias.grad   ** 2
 
-        model.classifier.weight.grad = None
-        model.classifier.bias.grad   = None
+        out_layer.weight.grad = None
+        out_layer.bias.grad   = None
 
         n_batches += 1
 
     if n_batches == 0:
         logger.warning("compute_fisher_diagonal: train_loader was empty, returning zero Fisher.")
-        return fisher, {"weight": model.classifier.weight.detach().clone(),
-                        "bias":   model.classifier.bias.detach().clone()}
+        return fisher, {"weight": out_layer.weight.detach().clone(),
+                        "bias":   out_layer.bias.detach().clone()}
 
     fisher["weight"] /= n_batches
     fisher["bias"]   /= n_batches
 
     theta_star = {
-        "weight": model.classifier.weight.detach().clone(),
-        "bias":   model.classifier.bias.detach().clone(),
+        "weight": out_layer.weight.detach().clone(),
+        "bias":   out_layer.bias.detach().clone(),
     }
 
     logger.info("Fisher diagonal computed over %d batches.", n_batches)

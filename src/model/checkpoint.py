@@ -22,6 +22,8 @@ def save_checkpoint(path: str, model: WhisperCommandClassifier, label_to_idx: di
             "idx_to_label": idx_to_label,
             "whisper_model_name": whisper_model_name,
             "freeze_encoder": freeze_encoder,
+            "head_hidden_dim": model.head_hidden_dim,
+            "head_dropout": model.head_dropout,
             "val_acc": val_acc,
             "epoch": epoch,
             "fisher": fisher,
@@ -39,7 +41,8 @@ def load_checkpoint(checkpoint_path: str, device: str = "cpu"):
     whisper_model_name = ckpt["whisper_model_name"]
     freeze_encoder = ckpt.get("freeze_encoder", True)
 
-    model = WhisperCommandClassifier(whisper_model_name, len(label_to_idx), freeze_encoder)
+    model = WhisperCommandClassifier(whisper_model_name, len(label_to_idx), freeze_encoder, 
+                                     head_hidden_dim=ckpt.get("head_hidden_dim", None), head_dropout=ckpt.get("head_dropout", 0.0))
     if "classifier_state_dict" in ckpt:
         model.classifier.load_state_dict(ckpt["classifier_state_dict"])
     else:

@@ -9,6 +9,7 @@ import torch
 from src.model.classifier import WhisperCommandClassifier
 from src.training.dataset import build_dataloaders, load_data_from_dir
 from src.training.trainer import train_model
+from src.utils.seed import set_seed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -18,6 +19,10 @@ CHECKPOINT = "models/BASE.pth"
 WHISPER_MODEL = "turbo"
 BATCH_SIZE = 8
 LR = 1e-4
+# Classification head: None = single linear layer; int = one hidden layer of this size
+HEAD_HIDDEN_DIM = None
+HEAD_DROPOUT = 0.0
+SEED = 0
 
 def select_commands(all_commands: list[str]) -> list[str]:
     print("\nAvailable commands:")
@@ -44,6 +49,7 @@ def select_commands(all_commands: list[str]) -> list[str]:
     return selected
 
 def main():
+    set_seed(SEED)
     all_data = load_data_from_dir(DATA_DIR)
     if not all_data:
         logger.error(f"No .wav files found in '{DATA_DIR}'")
@@ -67,7 +73,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
 
-    model = WhisperCommandClassifier(WHISPER_MODEL, len(unique_labels), freeze_encoder=True)
+    model = WhisperCommandClassifier(WHISPER_MODEL, len(unique_labels), freeze_encoder=True,
+                                    head_hidden_dim=HEAD_HIDDEN_DIM, head_dropout=HEAD_DROPOUT)
     model.to(device)
 
     train_loader, val_loader = build_dataloaders(data_dict, label_to_idx, model.n_mels, BATCH_SIZE)

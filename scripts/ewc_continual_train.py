@@ -11,12 +11,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.model.checkpoint import load_checkpoint, save_checkpoint
 from src.model.classifier import WhisperCommandClassifier
 from src.training.trainer import compute_fisher_diagonal
+from src.utils.seed import set_seed
 from scripts.continual_train import (LR, build_dataloaders, collect_files, expand_classifier, run_data_generation)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
 
 CHECKPOINT_PATH = "models/BASE.pth"
+# Dropout for this continual run. None = inherit the base model's rate; a float overrides it.
+# Only has an effect if the base was trained with a hidden layer (HEAD_HIDDEN_DIM set).
+HEAD_DROPOUT = None
+SEED = 0
 
 # ---------------------------------------------------------------------------
 # Interactive prompts
@@ -107,9 +112,8 @@ def train_ewc(model: WhisperCommandClassifier, train_loader, val_loader, device:
     fisher_d     = {k: v.to(device) for k, v in fisher.items()}
     theta_star_d = {k: v.to(device) for k, v in theta_star.items()}
 
-    optimizer = torch.optim.AdamW(
-        [model.classifier.weight, model.classifier.bias], lr=lr
-    )
+    out_layer = model.output_layer
+    optimizer = torch.optim.AdamW([out_layer.weight, out_layer.bias], lr=lr)
     criterion    = nn.CrossEntropyLoss()
     best_val_acc = 0.0
 
@@ -127,8 +131,8 @@ def train_ewc(model: WhisperCommandClassifier, train_loader, val_loader, device:
             task_loss = criterion(logits, label_idxs)
 
             ewc_penalty = (
-                (fisher_d["weight"] * (model.classifier.weight - theta_star_d["weight"]) ** 2).sum()
-                + (fisher_d["bias"] * (model.classifier.bias   - theta_star_d["bias"])   ** 2).sum()
+                (fisher_d["weight"] * (out_layer.weight - theta_star_d["weight"]) ** 2).sum()
+                + (fisher_d["bias"] * (out_layer.bias   - theta_star_d["bias"])   ** 2).sum()
             )
 
             loss = task_loss + (ewc_lambda / 2) * ewc_penalty
@@ -191,6 +195,7 @@ def train_ewc(model: WhisperCommandClassifier, train_loader, val_loader, device:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    set_seed(SEED)
     data_dir = Path("data")
     device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
@@ -234,7 +239,7 @@ def main() -> None:
 
     # 5. Build expanded model
     logger.info("Building %d-class model (was %d)...", n_old + 1, n_old)
-    model = expand_classifier(old_model, whisper_model_name, n_old + 1, device)
+    model = expand_classifier(old_model, whisper_model_name, n_old + 1, device, head_dropout=HEAD_DROPOUT)
     del old_model
     if device.type == "cuda":
         torch.cuda.empty_cache()

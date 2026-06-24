@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.model.checkpoint import load_checkpoint, save_checkpoint
 from src.model.classifier import WhisperCommandClassifier
 from src.training.dataset import CommandDataset
+from src.utils.seed import set_seed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -22,6 +23,10 @@ CHECKPOINT_PATH = "models/BASE.pth"
 N_SAMPLES = 150
 BATCH_SIZE = 8
 LR = 1e-5
+# Dropout for this continual run. None = inherit the base model's rate; a float overrides it.
+# Only has an effect if the base was trained with a hidden layer (HEAD_HIDDEN_DIM set).
+HEAD_DROPOUT = None
+SEED = 0
 
 
 # ---------------------------------------------------------------------------
@@ -76,14 +81,29 @@ def run_data_generation(new_label: str, data_dir: Path) -> None:
 # Model expansion
 # ---------------------------------------------------------------------------
 
-def expand_classifier(old_model: WhisperCommandClassifier, whisper_model_name: str, n_total: int, device: torch.device) -> WhisperCommandClassifier:
-    new_model = WhisperCommandClassifier(whisper_model_name, n_total, freeze_encoder=True)
+def expand_classifier(old_model: WhisperCommandClassifier, whisper_model_name: str, n_total: int, device: torch.device,
+                      head_dropout: float | None = None) -> WhisperCommandClassifier:
+    # head_dropout=None inherits the base's rate; pass a float to override it for this continual run.
+    dropout = old_model.head_dropout if head_dropout is None else head_dropout
+    new_model = WhisperCommandClassifier(
+        whisper_model_name, n_total, freeze_encoder=True,
+        head_hidden_dim=old_model.head_hidden_dim, head_dropout=dropout,
+    )
     new_model.encoder.load_state_dict(old_model.encoder.state_dict())
 
-    n_old = old_model.classifier.out_features
+    old_out = old_model.output_layer
+    new_out = new_model.output_layer
+    n_old = old_out.out_features
+
     with torch.no_grad():
-        new_model.classifier.weight[:n_old].copy_(old_model.classifier.weight)
-        new_model.classifier.bias[:n_old].copy_(old_model.classifier.bias)
+        # Copy the shared hidden layers verbatim (only the output layer grows with n_total).
+        if isinstance(old_model.classifier, nn.Sequential):
+            for new_layer, old_layer in zip(new_model.classifier[:-1], old_model.classifier[:-1]):
+                if hasattr(old_layer, "weight"):
+                    new_layer.load_state_dict(old_layer.state_dict())
+        # Expand the output layer: copy old class rows, leave new rows freshly initialised.
+        new_out.weight[:n_old].copy_(old_out.weight)
+        new_out.bias[:n_old].copy_(old_out.bias)
 
     new_model.to(device)
     return new_model
@@ -124,9 +144,10 @@ def build_dataloaders(file_paths: list[str], labels: list[str], label_to_idx: di
 def train_continual(model: WhisperCommandClassifier, train_loader: DataLoader, val_loader: DataLoader, device: torch.device,
     epochs: int, n_old: int, checkpoint_path: str, label_to_idx: dict, idx_to_label: dict, whisper_model_name: str,
     grad_update_prob: float, freeze_encoder: bool = True) -> None:
-    optimizer = torch.optim.AdamW(
-        [model.classifier.weight, model.classifier.bias], lr=LR
-    )
+    # Train only the output layer: the shared hidden layer (if any) stays frozen so that
+    # updating on new-class-only data can't degrade previously learned classes.
+    out_layer = model.output_layer
+    optimizer = torch.optim.AdamW([out_layer.weight, out_layer.bias], lr=LR)
     criterion = nn.CrossEntropyLoss()
     best_val_acc = 0.0
 
@@ -147,10 +168,10 @@ def train_continual(model: WhisperCommandClassifier, train_loader: DataLoader, v
             # Per batch, decide whether to zero old head row gradients.
             if random.random() >= grad_update_prob:
                 with torch.no_grad():
-                    if model.classifier.weight.grad is not None:
-                        model.classifier.weight.grad[:n_old] = 0
-                    if model.classifier.bias.grad is not None:
-                        model.classifier.bias.grad[:n_old] = 0
+                    if out_layer.weight.grad is not None:
+                        out_layer.weight.grad[:n_old] = 0
+                    if out_layer.bias.grad is not None:
+                        out_layer.bias.grad[:n_old] = 0
 
             optimizer.step()
 
@@ -197,6 +218,7 @@ def train_continual(model: WhisperCommandClassifier, train_loader: DataLoader, v
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    set_seed(SEED)
     data_dir = Path("data")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -234,7 +256,7 @@ def main() -> None:
 
     # 5. Build expanded model
     logger.info("Building %d-class model (was %d)...", n_old + 1, n_old)
-    model = expand_classifier(old_model, whisper_model_name, n_old + 1, device)
+    model = expand_classifier(old_model, whisper_model_name, n_old + 1, device, head_dropout=HEAD_DROPOUT)
     del old_model
     if device.type == "cuda":
         torch.cuda.empty_cache()
