@@ -22,11 +22,10 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_PATH = "models/BASE.pth"
 N_SAMPLES = 150
 BATCH_SIZE = 8
-LR = 1e-5
-# Dropout for this continual run. None = inherit the base model's rate; a float overrides it.
-# Only has an effect if the base was trained with a hidden layer (HEAD_HIDDEN_DIM set).
+LR = 1e-3
 HEAD_DROPOUT = None
 SEED = 0
+OLD_VAL_SAMPLES_PER_CLASS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +84,7 @@ def expand_classifier(old_model: WhisperCommandClassifier, whisper_model_name: s
                       head_dropout: float | None = None) -> WhisperCommandClassifier:
     # head_dropout=None inherits the base's rate; pass a float to override it for this continual run.
     dropout = old_model.head_dropout if head_dropout is None else head_dropout
+    dropout = dropout or 0.0  # a base saved with head_dropout=None must not reach nn.Dropout(None)
     new_model = WhisperCommandClassifier(
         whisper_model_name, n_total, freeze_encoder=True,
         head_hidden_dim=old_model.head_hidden_dim, head_dropout=dropout,
@@ -126,10 +126,37 @@ def collect_files(new_label: str, data_dir: Path) -> tuple[list[str], list[str]]
     return new_files, [new_label] * len(new_files)
 
 
-def build_dataloaders(file_paths: list[str], labels: list[str], label_to_idx: dict, n_mels: int) -> tuple[DataLoader, DataLoader]:
+def collect_old_val_files(label_to_idx: dict, new_label: str, data_dir: Path, per_class: int) -> tuple[list[str], list[str]]:
+    # Sample a few clips from each *existing* class purely for validation, so val can catch
+    # catastrophic forgetting. Classes whose data dir is missing are skipped (data may have
+    # been generated in an earlier session and cleaned up) — the run still works without them.
+    if per_class <= 0:
+        return [], []
+    paths, labels = [], []
+    for label in label_to_idx:
+        if label == new_label:
+            continue
+        class_dir = data_dir / label
+        if not class_dir.exists():
+            continue
+        wavs = sorted(str(f) for f in class_dir.iterdir() if f.suffix.lower() == ".wav")
+        if not wavs:
+            continue
+        sample = wavs[:per_class]
+        paths.extend(sample)
+        labels.extend([label] * len(sample))
+    return paths, labels
+
+
+def build_dataloaders(file_paths: list[str], labels: list[str], label_to_idx: dict, n_mels: int,
+                      extra_val_paths: list[str] | None = None, extra_val_labels: list[str] | None = None) -> tuple[DataLoader, DataLoader]:
     train_paths, val_paths, train_labels, val_labels = train_test_split(
         file_paths, labels, test_size=0.2, random_state=42, stratify=labels
     )
+    # Old-class clips only pad the validation set — training stays new-class-only by design.
+    if extra_val_paths:
+        val_paths = val_paths + extra_val_paths
+        val_labels = val_labels + extra_val_labels
     train_ds = CommandDataset(train_paths, train_labels, label_to_idx, n_mels, augment=True)
     val_ds = CommandDataset(val_paths, val_labels, label_to_idx, n_mels, augment=False)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
@@ -150,6 +177,7 @@ def train_continual(model: WhisperCommandClassifier, train_loader: DataLoader, v
     optimizer = torch.optim.AdamW([out_layer.weight, out_layer.bias], lr=LR)
     criterion = nn.CrossEntropyLoss()
     best_val_acc = 0.0
+    saved_any = False
 
     for epoch in range(epochs):
         # --- Train ---
@@ -180,8 +208,10 @@ def train_continual(model: WhisperCommandClassifier, train_loader: DataLoader, v
             t_total += label_idxs.size(0)
 
         # --- Validate ---
+        new_class_idx = n_old
         model.eval()
         v_loss = v_correct = v_total = 0
+        v_new_correct = v_new_total = 0
         with torch.no_grad():
             for mels, label_idxs, n_frames in val_loader:
                 mels = mels.to(device)
@@ -190,16 +220,25 @@ def train_continual(model: WhisperCommandClassifier, train_loader: DataLoader, v
                 logits = model(mels, n_frames)
                 loss = criterion(logits, label_idxs)
                 v_loss += loss.item()
-                v_correct += (logits.argmax(1) == label_idxs).sum().item()
+                correct = logits.argmax(1) == label_idxs
+                v_correct += correct.sum().item()
                 v_total += label_idxs.size(0)
+                new_mask = label_idxs == new_class_idx
+                v_new_correct += correct[new_mask].sum().item()
+                v_new_total += new_mask.sum().item()
 
         t_acc = 100 * t_correct / t_total
         v_acc = 100 * v_correct / v_total
+        new_acc = 100 * v_new_correct / v_new_total if v_new_total else 0.0
+        v_old_total = v_total - v_new_total
+        old_acc = 100 * (v_correct - v_new_correct) / v_old_total if v_old_total else None
+        old_str = f"{old_acc:.1f}%" if old_acc is not None else "n/a"
         logger.info(
-            "Epoch %02d/%02d | Train %.4f / %.1f%% | Val %.4f / %.1f%%",
+            "Epoch %02d/%02d | Train %.4f / %.1f%% | Val %.4f / %.1f%% | new-cls %.1f%% | old-cls %s",
             epoch + 1, epochs,
             t_loss / len(train_loader), t_acc,
             v_loss / len(val_loader), v_acc,
+            new_acc, old_str,
         )
 
         if v_acc > best_val_acc:
@@ -208,7 +247,16 @@ def train_continual(model: WhisperCommandClassifier, train_loader: DataLoader, v
                 checkpoint_path, model, label_to_idx, idx_to_label,
                 whisper_model_name, freeze_encoder, v_acc, epoch + 1,
             )
+            saved_any = True
             logger.info("  → Best checkpoint saved (val_acc=%.1f%%)", v_acc)
+
+        if epoch + 1 == epochs and not saved_any:
+            save_checkpoint(
+                checkpoint_path, model, label_to_idx, idx_to_label,
+                whisper_model_name, freeze_encoder, v_acc, epoch + 1,
+            )
+            saved_any = True
+            logger.info("  → Final-epoch checkpoint saved as fallback (val_acc=%.1f%%)", v_acc)
 
     logger.info("Training complete. Best val accuracy: %.1f%%", best_val_acc)
 
@@ -263,8 +311,16 @@ def main() -> None:
 
     # 6. Collect training data and build loaders
     file_paths, labels = collect_files(new_label, data_dir)
+    old_val_paths, old_val_labels = collect_old_val_files(
+        label_to_idx, new_label, data_dir, OLD_VAL_SAMPLES_PER_CLASS
+    )
+    if old_val_paths:
+        logger.info("Added %d old-class clips to validation (retention check).", len(old_val_paths))
+    else:
+        logger.warning("No old-class data found — validation measures the new class only.")
     train_loader, val_loader = build_dataloaders(
-        file_paths, labels, label_to_idx, model.n_mels
+        file_paths, labels, label_to_idx, model.n_mels,
+        extra_val_paths=old_val_paths, extra_val_labels=old_val_labels,
     )
     logger.info("Train: %d  Val: %d", len(train_loader.dataset), len(val_loader.dataset))
 
