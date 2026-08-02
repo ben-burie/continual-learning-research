@@ -8,7 +8,8 @@ from src.model.classifier import WhisperCommandClassifier
 logger = logging.getLogger(__name__)
 
 def save_checkpoint(path: str, model: WhisperCommandClassifier, label_to_idx: dict, idx_to_label: dict, whisper_model_name: str, freeze_encoder: bool, val_acc: float,
-    epoch: int, fisher: dict | None = None, theta_star: dict | None = None) -> None:
+    epoch: int, fisher: dict | None = None, theta_star: dict | None = None,
+    exemplars: dict | None = None, bias_correction: dict | None = None) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     if freeze_encoder:
         state = {"classifier_state_dict": model.classifier.state_dict()}
@@ -28,10 +29,27 @@ def save_checkpoint(path: str, model: WhisperCommandClassifier, label_to_idx: di
             "epoch": epoch,
             "fisher": fisher,
             "theta_star": theta_star,
+            "exemplars": exemplars,
+            "bias_correction": bias_correction,
         },
         path,
     )
     logger.info(f"Checkpoint saved → {path}")
+
+
+def load_checkpoint_extras(checkpoint_path: str) -> dict:
+    """Read the metadata that load_checkpoint's tuple doesn't carry.
+
+    Kept separate so load_checkpoint's return signature — unpacked positionally in
+    several scripts — stays stable as new keys are added.
+    """
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return {
+        "exemplars": ckpt.get("exemplars"),
+        "bias_correction": ckpt.get("bias_correction"),
+        "val_acc": ckpt.get("val_acc"),
+        "epoch": ckpt.get("epoch"),
+    }
 
 
 def load_checkpoint(checkpoint_path: str, device: str = "cpu"):

@@ -11,14 +11,57 @@ logger = logging.getLogger(__name__)
 _FISHER_MAX_BATCHES = 100
 
 
-def compute_fisher_diagonal(model, train_loader, device) -> tuple[dict, dict]:
-    """Compute diagonal Fisher Information Matrix over the classifier head."""
-    model.eval()
+def output_layer_param_names(model) -> tuple[str, str]:
+    """Keys of the output layer's weight/bias within model.classifier.named_parameters()."""
+    if isinstance(model.classifier, nn.Sequential):
+        last = len(model.classifier) - 1
+        return f"{last}.weight", f"{last}.bias"
+    return "weight", "bias"
+
+
+def configure_head_training(model, train_hidden_layer: bool) -> list:
+    """Select which head parameters the continual scripts optimise, freezing the rest.
+
+    train_hidden_layer=False keeps the base model's representation fixed and updates only
+    the output layer. True also updates the shared hidden layers — which is what EWC and
+    distillation exist to make safe, but which nothing protects if those mechanisms don't
+    cover the hidden parameters.
+
+    The unselected parameters are frozen explicitly rather than merely omitted from the
+    optimiser, so gradients don't accumulate in buffers nothing ever reads.
+    """
     out_layer = model.output_layer
-    fisher = {
-        "weight": torch.zeros_like(out_layer.weight),
-        "bias":   torch.zeros_like(out_layer.bias),
-    }
+    if train_hidden_layer:
+        for p in model.classifier.parameters():
+            p.requires_grad_(True)
+        trainable = list(model.classifier.parameters())
+    else:
+        for p in model.classifier.parameters():
+            p.requires_grad_(False)
+        out_layer.weight.requires_grad_(True)
+        out_layer.bias.requires_grad_(True)
+        trainable = [out_layer.weight, out_layer.bias]
+
+    n_params = sum(p.numel() for p in trainable)
+    logger.info("Training %d head parameter tensors (%d values) — hidden layer %s.",
+                len(trainable), n_params, "trainable" if train_hidden_layer else "frozen")
+    return trainable
+
+
+def compute_fisher_diagonal(model, train_loader, device) -> tuple[dict, dict]:
+    """Diagonal Fisher Information Matrix over the classifier head.
+
+    Keyed by parameter name within model.classifier, so a plain single-Linear head yields
+    {"weight", "bias"} — the same layout earlier checkpoints already use. A head with a
+    hidden layer additionally yields its entries, letting EWC protect them when
+    TRAIN_HIDDEN_LAYER is on.
+    """
+    model.eval()
+    named = {n: p for n, p in model.classifier.named_parameters() if p.requires_grad}
+    if not named:
+        logger.warning("compute_fisher_diagonal: no trainable head parameters.")
+        return {}, {}
+    fisher = {n: torch.zeros_like(p) for n, p in named.items()}
 
     n_batches = 0
     for mels, _, n_frames in train_loader:
@@ -27,8 +70,8 @@ def compute_fisher_diagonal(model, train_loader, device) -> tuple[dict, dict]:
         mels     = mels.to(device)
         n_frames = n_frames.to(device)
 
-        out_layer.weight.grad = None
-        out_layer.bias.grad   = None
+        for p in named.values():
+            p.grad = None
 
         logits    = model(mels, n_frames)
         log_probs = F.log_softmax(logits, dim=1)
@@ -36,28 +79,25 @@ def compute_fisher_diagonal(model, train_loader, device) -> tuple[dict, dict]:
         loss      = F.nll_loss(log_probs, predicted)
         loss.backward()
 
-        fisher["weight"] += out_layer.weight.grad ** 2
-        fisher["bias"]   += out_layer.bias.grad   ** 2
+        for name, p in named.items():
+            if p.grad is not None:
+                fisher[name] += p.grad ** 2
 
-        out_layer.weight.grad = None
-        out_layer.bias.grad   = None
+        for p in named.values():
+            p.grad = None
 
         n_batches += 1
 
+    theta_star = {n: p.detach().clone() for n, p in named.items()}
+
     if n_batches == 0:
         logger.warning("compute_fisher_diagonal: train_loader was empty, returning zero Fisher.")
-        return fisher, {"weight": out_layer.weight.detach().clone(),
-                        "bias":   out_layer.bias.detach().clone()}
+        return fisher, theta_star
 
-    fisher["weight"] /= n_batches
-    fisher["bias"]   /= n_batches
+    for name in fisher:
+        fisher[name] /= n_batches
 
-    theta_star = {
-        "weight": out_layer.weight.detach().clone(),
-        "bias":   out_layer.bias.detach().clone(),
-    }
-
-    logger.info("Fisher diagonal computed over %d batches.", n_batches)
+    logger.info("Fisher diagonal computed over %d batches for: %s", n_batches, sorted(fisher))
     return fisher, theta_star
 
 

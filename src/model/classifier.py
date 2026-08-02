@@ -41,7 +41,13 @@ class WhisperCommandClassifier(nn.Module):
             return self.classifier[-1]
         return self.classifier
 
-    def forward(self, mel: torch.Tensor, n_frames: torch.Tensor | None = None) -> torch.Tensor:
+    def pooled_features(self, mel: torch.Tensor, n_frames: torch.Tensor | None = None) -> torch.Tensor:
+        """Masked mean-pooled encoder output [B, hidden_dim].
+
+        Split out from forward() so callers can run more than one head over a single
+        encoder pass (knowledge distillation) or use the features directly (exemplar
+        herding).
+        """
         features = self.encoder(mel)  # [B, T, hidden_dim]
 
         if n_frames is not None:
@@ -50,8 +56,8 @@ class WhisperCommandClassifier(nn.Module):
             enc_frames = (n_frames // 2).clamp(min=1)
             mask = (torch.arange(T, device=features.device).unsqueeze(0) < enc_frames.unsqueeze(1))
             mask = mask.unsqueeze(-1).float()
-            pooled = (features * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        else:
-            pooled = features.mean(dim=1)
+            return (features * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        return features.mean(dim=1)
 
-        return self.classifier(pooled)  # [B, num_classes]
+    def forward(self, mel: torch.Tensor, n_frames: torch.Tensor | None = None) -> torch.Tensor:
+        return self.classifier(self.pooled_features(mel, n_frames))  # [B, num_classes]

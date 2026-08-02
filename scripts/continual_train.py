@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.model.checkpoint import load_checkpoint, save_checkpoint
 from src.model.classifier import WhisperCommandClassifier
 from src.training.dataset import CommandDataset
+from src.training.trainer import configure_head_training
 from src.utils.seed import set_seed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
@@ -26,6 +27,7 @@ LR = 1e-3
 HEAD_DROPOUT = None
 SEED = 0
 OLD_VAL_SAMPLES_PER_CLASS = 15
+TRAIN_HIDDEN_LAYER = False
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +172,13 @@ def build_dataloaders(file_paths: list[str], labels: list[str], label_to_idx: di
 
 def train_continual(model: WhisperCommandClassifier, train_loader: DataLoader, val_loader: DataLoader, device: torch.device,
     epochs: int, n_old: int, checkpoint_path: str, label_to_idx: dict, idx_to_label: dict, whisper_model_name: str,
-    grad_update_prob: float, freeze_encoder: bool = True) -> None:
-    # Train only the output layer: the shared hidden layer (if any) stays frozen so that
-    # updating on new-class-only data can't degrade previously learned classes.
+    grad_update_prob: float, freeze_encoder: bool = True,
+    train_hidden_layer: bool = TRAIN_HIDDEN_LAYER) -> None:
+    # By default only the output layer trains: the shared hidden layer (if any) stays
+    # frozen so that updating on new-class-only data can't degrade previously learned
+    # classes. train_hidden_layer=True lifts that, with nothing to guard against drift.
     out_layer = model.output_layer
-    optimizer = torch.optim.AdamW([out_layer.weight, out_layer.bias], lr=LR)
+    optimizer = torch.optim.AdamW(configure_head_training(model, train_hidden_layer), lr=LR)
     criterion = nn.CrossEntropyLoss()
     best_val_acc = 0.0
     saved_any = False
@@ -335,6 +339,7 @@ def main() -> None:
         checkpoint_out, label_to_idx, idx_to_label, whisper_model_name,
         grad_update_prob=grad_update_prob,
         freeze_encoder=base_freeze_encoder,
+        train_hidden_layer=TRAIN_HIDDEN_LAYER,
     )
 
 if __name__ == "__main__":
