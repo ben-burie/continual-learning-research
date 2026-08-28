@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import torch
 
 from src.audio.preprocessing import preprocess_audio
-from src.model.checkpoint import load_checkpoint
+from src.model.checkpoint import load_checkpoint, load_checkpoint_extras
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -62,7 +62,8 @@ def main() -> None:
     model, label_to_idx, idx_to_label, _, _, _, _ = load_checkpoint(str(checkpoint_path), device=str(device))
     model.eval()
     n_mels = model.n_mels
-    logger.info("Checkpoint loaded (%d classes)", len(label_to_idx))
+    seed = load_checkpoint_extras(str(checkpoint_path))["seed"]
+    logger.info("Checkpoint loaded (%d classes, seed=%s)", len(label_to_idx), seed)
 
     test_data = _scan_test_dir(test_dir)
     if not test_data:
@@ -133,7 +134,8 @@ def main() -> None:
     csv_dir = Path("model_eval")
     csv_dir.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = csv_dir / f"{checkpoint_path.stem}_{timestamp}_evaluation.csv"
+    seed_tag = "unknown" if seed is None else str(seed)
+    csv_path = csv_dir / f"{checkpoint_path.stem}_seed{seed_tag}_{timestamp}_evaluation.csv"
 
     rows = []
     per_class_total: dict[str, int] = defaultdict(int)
@@ -153,6 +155,7 @@ def main() -> None:
         print(f"{wav_path.name:<45} {actual_label:<25} {pred_label:<25} {conf:>6.1%}  {indicator}")
 
         rows.append({
+            "seed": seed_tag,
             "file": wav_path.name,
             "actual_label": actual_label,
             "predicted_label": pred_label,
@@ -169,18 +172,18 @@ def main() -> None:
     overall_acc = correct / total if total else 0.0
     print()
     print("=" * 60)
-    print(f"OVERALL ACCURACY: {correct}/{total}  ({overall_acc:.1%})")
+    print(f"OVERALL ACCURACY: {correct}/{total}  ({overall_acc:.1%})   [seed {seed_tag}]")
     print()
-    print(f"{'LABEL':<30} {'CORRECT':>8} {'TOTAL':>8} {'ACCURACY':>10}")
-    print("-" * 60)
+    print(f"{'LABEL':<30} {'CORRECT':>8} {'TOTAL':>8} {'ACCURACY':>10} {'1 CLIP':>10}")
+    print("-" * 72)
     for label in sorted(per_class_total):
         n = per_class_total[label]
         c = per_class_correct[label]
-        print(f"{label:<30} {c:>8} {n:>8} {c/n:>10.1%}")
-    print("=" * 60)
+        print(f"{label:<30} {c:>8} {n:>8} {c/n:>10.1%} {1/n:>10.2%}")
+    print("=" * 72)
 
     with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["file", "actual_label", "predicted_label", "confidence", "correct"])
+        writer = csv.DictWriter(f, fieldnames=["seed", "file", "actual_label", "predicted_label", "confidence", "correct"])
         writer.writeheader()
         writer.writerows(rows)
     print(f"\nResults saved to: {csv_path}")

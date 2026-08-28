@@ -6,6 +6,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.audio.preprocessing import preprocess_audio
 from src.training.augmentation import SpecAugment
+from src.utils.seed import dataloader_generator
 
 logger = logging.getLogger(__name__)
 
@@ -44,21 +45,26 @@ def load_data_from_dir(data_dir: str) -> dict[str, list[str]]:
 
 
 def build_dataloaders(
-    data_dict: dict, label_to_idx: dict, n_mels: int, batch_size: int
+    data_dict: dict, label_to_idx: dict, n_mels: int, batch_size: int, seed: int = 42
 ) -> tuple[DataLoader, DataLoader]:
-    """80/20 stratified split → (train_loader, val_loader). Train set gets SpecAugment."""
+    """80/20 stratified split → (train_loader, val_loader). Train set gets SpecAugment.
+
+    `seed` drives both the split and the shuffle order, so a run is reproducible from
+    the seed alone rather than from the seed plus whatever RNG ran before it.
+    """
     file_paths, labels = [], []
     for label, paths in data_dict.items():
         file_paths.extend(paths)
         labels.extend([label] * len(paths))
 
     train_paths, val_paths, train_labels, val_labels = train_test_split(
-        file_paths, labels, test_size=0.2, random_state=42, stratify=labels
+        file_paths, labels, test_size=0.2, random_state=seed, stratify=labels
     )
 
     train_ds = CommandDataset(train_paths, train_labels, label_to_idx, n_mels, augment=True)
     val_ds = CommandDataset(val_paths, val_labels, label_to_idx, n_mels, augment=False)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0,
+                              generator=dataloader_generator(seed))
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
     return train_loader, val_loader

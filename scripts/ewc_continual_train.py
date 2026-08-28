@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.model.checkpoint import load_checkpoint, save_checkpoint
 from src.model.classifier import WhisperCommandClassifier
 from src.training.trainer import compute_fisher_diagonal, configure_head_training, output_layer_param_names
-from src.utils.seed import set_seed
+from src.utils.seed import resolve_seed, set_seed
 from scripts.continual_train import (LR, build_dataloaders, collect_files, expand_classifier, run_data_generation)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_PATH = "models/BASE.pth"
 HEAD_DROPOUT = None
-SEED = 0
+SEED = resolve_seed()
 TRAIN_HIDDEN_LAYER = False
 
 # ---------------------------------------------------------------------------
@@ -97,6 +97,7 @@ def accumulate_and_resave(checkpoint_path: str, train_loader, device: torch.devi
         val_acc=val_acc, epoch=epoch,
         fisher=accumulated,
         theta_star=final_theta_star,
+        seed=SEED,
     )
     logger.info("Fisher accumulated and checkpoint re-saved → %s", checkpoint_path)
 
@@ -180,6 +181,7 @@ def train_ewc(model: WhisperCommandClassifier, train_loader, val_loader, device:
                 val_acc=v_acc, epoch=epoch + 1,
                 fisher={k: v.cpu() for k, v in fisher_d.items()},
                 theta_star={k: v.cpu() for k, v in theta_star_d.items()},
+                seed=SEED,
             )
             logger.info("  → Best checkpoint saved (val_acc=%.1f%%)", v_acc)
 
@@ -191,6 +193,7 @@ def train_ewc(model: WhisperCommandClassifier, train_loader, val_loader, device:
         val_acc=v_acc, epoch=epochs,
         fisher={k: v.cpu() for k, v in fisher_d.items()},
         theta_star={k: v.cpu() for k, v in theta_star_d.items()},
+        seed=SEED,
     )
     logger.info("  → Last-epoch checkpoint saved → %s (val_acc=%.1f%%)", le_path, v_acc)
 
@@ -277,7 +280,7 @@ def main() -> None:
 
     # 7. Build dataloaders (new command data only — EWC penalty handles forgetting)
     file_paths, labels = collect_files(new_label, data_dir)
-    train_loader, val_loader = build_dataloaders(file_paths, labels, label_to_idx, model.n_mels)
+    train_loader, val_loader = build_dataloaders(file_paths, labels, label_to_idx, model.n_mels, seed=SEED)
     logger.info("Train: %d  Val: %d", len(train_loader.dataset), len(val_loader.dataset))
 
     # 8. Train with EWC loss

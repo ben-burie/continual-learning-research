@@ -103,7 +103,7 @@ def compute_fisher_diagonal(model, train_loader, device) -> tuple[dict, dict]:
 
 def train_model(model, train_loader, val_loader, device, epochs: int, lr: float, checkpoint_path: str,
                 label_to_idx: dict, idx_to_label: dict, whisper_model_name: str, freeze_encoder: bool,
-                compute_fisher: bool = True) -> None:
+                compute_fisher: bool = True, seed: int | None = None) -> None:
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=lr)
     criterion = nn.CrossEntropyLoss()
     best_val_acc = 0.0
@@ -157,7 +157,7 @@ def train_model(model, train_loader, val_loader, device, epochs: int, lr: float,
             save_checkpoint(
                 checkpoint_path, model, label_to_idx, idx_to_label,
                 whisper_model_name, freeze_encoder, v_acc, epoch + 1,
-                fisher=fisher, theta_star=theta_star,
+                fisher=fisher, theta_star=theta_star, seed=seed,
             )
             logger.info(f"  → Best checkpoint saved (val_acc={v_acc:.1f}%)"
                         + (" [Fisher computed]" if compute_fisher else ""))

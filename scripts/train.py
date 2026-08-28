@@ -9,7 +9,7 @@ import torch
 from src.model.classifier import WhisperCommandClassifier
 from src.training.dataset import build_dataloaders, load_data_from_dir
 from src.training.trainer import train_model
-from src.utils.seed import set_seed
+from src.utils.seed import resolve_seed, set_seed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ LR = 1e-4
 # Classification head: None = single linear layer; int = one hidden layer of this size
 HEAD_HIDDEN_DIM = None
 HEAD_DROPOUT = 0.0
-SEED = 0
+SEED = resolve_seed()
 
 def select_commands(all_commands: list[str]) -> list[str]:
     print("\nAvailable commands:")
@@ -77,7 +77,7 @@ def main():
                                     head_hidden_dim=HEAD_HIDDEN_DIM, head_dropout=HEAD_DROPOUT)
     model.to(device)
 
-    train_loader, val_loader = build_dataloaders(data_dict, label_to_idx, model.n_mels, BATCH_SIZE)
+    train_loader, val_loader = build_dataloaders(data_dict, label_to_idx, model.n_mels, BATCH_SIZE, seed=SEED)
     logger.info(f"Train: {len(train_loader.dataset)}  Val: {len(val_loader.dataset)}")
     logger.info(f"Checkpoint: {CHECKPOINT}")
 
@@ -85,7 +85,7 @@ def main():
         model, train_loader, val_loader, device,
         epoch_input, LR, CHECKPOINT,
         label_to_idx, idx_to_label, WHISPER_MODEL, freeze_encoder=True,
-        compute_fisher=True,
+        compute_fisher=True, seed=SEED,
     )
 
 if __name__ == "__main__":

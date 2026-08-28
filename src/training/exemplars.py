@@ -1,4 +1,5 @@
 import logging
+import random
 from pathlib import Path
 
 import torch
@@ -102,13 +103,19 @@ def resolve_exemplars(stored: dict | None, labels: list[str], data_dir: Path, mo
 
 
 def partition_old_classes(exemplars: dict[str, list[str]], data_dir: Path, bic_val_per_class: int,
-                          val_per_class: int) -> tuple[tuple[list, list], tuple[list, list], tuple[list, list]]:
+                          val_per_class: int, rng: random.Random | None = None,
+                          ) -> tuple[tuple[list, list], tuple[list, list], tuple[list, list]]:
     """Split the old classes three ways, with no clip appearing in more than one set.
 
     Returns (train, bic_val, val) as (paths, labels) pairs:
       train    — exemplars used for the distillation loss
       bic_val  — exemplars held out to fit the bias-correction parameters
       val      — non-exemplar clips, so retention is measured on genuinely unseen audio
+
+    Pass an `rng` to draw both splits at random. Without one the split is a fixed slice of
+    the herding order and a fixed slice of sorted filenames, both of which are the same in
+    every run — herding is a deterministic greedy over a frozen encoder's features, so a
+    seed sweep that leaves this deterministic re-trains on identical data every time.
     """
     train_paths, train_labels = [], []
     bic_paths, bic_labels = [], []
@@ -116,15 +123,24 @@ def partition_old_classes(exemplars: dict[str, list[str]], data_dir: Path, bic_v
 
     for label, paths in exemplars.items():
         n_train = max(len(paths) - bic_val_per_class, 1)
-        # Herding order is most-representative-first, so the head of the list trains.
-        ex_train, ex_bic = paths[:n_train], paths[n_train:]
+        if rng is None:
+            # Herding order is most-representative-first, so the head of the list trains.
+            ex_train, ex_bic = paths[:n_train], paths[n_train:]
+        else:
+            shuffled = list(paths)
+            rng.shuffle(shuffled)
+            ex_train, ex_bic = shuffled[:n_train], shuffled[n_train:]
         train_paths.extend(ex_train)
         train_labels.extend([label] * len(ex_train))
         bic_paths.extend(ex_bic)
         bic_labels.extend([label] * len(ex_bic))
 
         used = set(paths)
-        held_out = [p for p in list_class_wavs(data_dir, label) if p not in used][:val_per_class]
+        pool = [p for p in list_class_wavs(data_dir, label) if p not in used]
+        if rng is None:
+            held_out = pool[:val_per_class]
+        else:
+            held_out = rng.sample(pool, min(val_per_class, len(pool)))
         val_paths.extend(held_out)
         val_labels.extend([label] * len(held_out))
 

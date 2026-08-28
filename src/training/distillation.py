@@ -7,16 +7,35 @@ logger = logging.getLogger(__name__)
 
 
 def icarl_distillation_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor,
-                            label_idxs: torch.Tensor, n_old: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """iCaRL / LwF.MC loss: per-node binary cross-entropy over sigmoid outputs.
+                            label_idxs: torch.Tensor, n_old: int, replay_ce_weight: float = 0.0,
+                            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """iCaRL / LwF.MC loss: per-node binary cross-entropy over sigmoid outputs, plus an
+    optional softmax cross-entropy replay term.
 
     Old nodes are supervised by the frozen pre-update network's soft targets, new nodes
     by the binary ground-truth label. Note that an old-class exemplar gets an all-zero
     target on the new nodes — its own label never appears as a hard target, so old-class
     supervision reaches the student only through the teacher. That is iCaRL as specified.
 
-    Returns (total, distill_term, class_term), each summed over nodes and averaged over
-    the batch so the two terms are directly comparable in the logs.
+    On a single-Linear head over a frozen encoder that specification is degenerate. The
+    per-node BCE decouples the output rows, and the old rows begin as an exact copy of the
+    teacher over the exact same pooled features, so their target is already met: their
+    gradient is *identically zero* on every batch (verifiable in float64 — in float32 the
+    residual is round-off, which Adam's normalisation then inflates to a full-size step).
+    Nothing the new class does can move them, and the exemplars only ever act as negatives
+    for the new row.
+
+    replay_ce_weight > 0 adds cross-entropy on the true labels. Its softmax normaliser
+    couples every row, so the exemplars finally train the old rows and the distillation
+    term becomes a genuine pull-back towards the teacher instead of a no-op. This is a
+    deliberate departure from the paper — report such runs as replay + LwF, not iCaRL.
+
+    The terms sit on different scales: distill and classification are summed over their
+    nodes before the batch mean, while cross-entropy is a single mean, so a weight of 1.0
+    already places replay well below distillation.
+
+    Returns (total, distill_term, class_term, replay_term), each as it enters the total,
+    so the three parts sum to it.
     """
     targets = torch.zeros_like(student_logits)
     targets[:, :n_old] = torch.sigmoid(teacher_logits.detach())
@@ -27,7 +46,17 @@ def icarl_distillation_loss(student_logits: torch.Tensor, teacher_logits: torch.
     per_node = F.binary_cross_entropy_with_logits(student_logits, targets, reduction="none")
     distill = per_node[:, :n_old].sum(dim=1).mean()
     classification = per_node[:, n_old:].sum(dim=1).mean()
-    return distill + classification, distill, classification
+
+    # Applied to the whole batch, not just the exemplars: the new-class clips already carry
+    # a hard target through `classification`, but keeping cross-entropy over every sample is
+    # what makes this arm run the same objective as the CrossEntropyLoss baselines it is
+    # being compared against.
+    if replay_ce_weight:
+        replay = replay_ce_weight * F.cross_entropy(student_logits, label_idxs)
+    else:
+        replay = student_logits.new_zeros(())
+
+    return distill + classification + replay, distill, classification, replay
 
 
 def fit_bias_correction(model, loader, n_old: int, device, epochs: int = 200,

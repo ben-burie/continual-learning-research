@@ -1,5 +1,6 @@
 import copy
 import logging
+import random
 import sys
 from datetime import date
 from pathlib import Path
@@ -16,7 +17,7 @@ from src.training.dataset import CommandDataset
 from src.training.distillation import fit_bias_correction, fold_bias_correction, icarl_distillation_loss
 from src.training.exemplars import partition_old_classes, resolve_exemplars, select_exemplars_herding
 from src.training.trainer import configure_head_training
-from src.utils.seed import set_seed
+from src.utils.seed import dataloader_generator, resolve_seed, set_seed
 from scripts.continual_train import (BATCH_SIZE, LR, collect_files, expand_classifier, run_data_generation)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
@@ -24,8 +25,10 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_PATH = "models/BASE.pth"
 HEAD_DROPOUT = None
-SEED = 0
+SEED = resolve_seed()
 TRAIN_HIDDEN_LAYER = False
+
+REPLAY_CE_WEIGHT = 1.0
 
 # Exemplars kept per class for replay + distillation.
 EXEMPLARS_PER_CLASS = 20
@@ -64,28 +67,32 @@ def prompt_training_config() -> tuple[str, int]:
 # ---------------------------------------------------------------------------
 
 def _loader(paths: list[str], labels: list[str], label_to_idx: dict, n_mels: int,
-            augment: bool, shuffle: bool) -> DataLoader:
+            augment: bool, shuffle: bool, generator: torch.Generator | None = None) -> DataLoader:
     ds = CommandDataset(paths, labels, label_to_idx, n_mels, augment=augment)
-    return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=shuffle, num_workers=0)
+    return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=shuffle, num_workers=0, generator=generator)
 
 
 def build_loaders(exemplars: dict, new_label: str, new_files: list[str], data_dir: Path,
-                  label_to_idx: dict, n_mels: int) -> tuple[DataLoader, DataLoader, DataLoader]:
+                  label_to_idx: dict, n_mels: int, seed: int) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Partition everything three ways — see partition_old_classes for the old-class side.
 
     The new class is split 80/20; the bias-correction clips are carved out of the val
     side so they never touch stage-1 training.
+
+    Every split is drawn from `seed`. They used to be fixed - random_state=42 plus a
+    fixed slice of the herding order - which left a seed sweep re-training on
+    byte-identical data in every run.
     """
     (ex_train, ex_train_lbl), (ex_bic, ex_bic_lbl), (old_val, old_val_lbl) = partition_old_classes(
-        exemplars, data_dir, BIC_VAL_PER_CLASS, OLD_VAL_SAMPLES_PER_CLASS
+        exemplars, data_dir, BIC_VAL_PER_CLASS, OLD_VAL_SAMPLES_PER_CLASS, rng=random.Random(seed)
     )
 
-    new_train, new_held = train_test_split(new_files, test_size=0.2, random_state=42)
+    new_train, new_held = train_test_split(new_files, test_size=0.2, random_state=seed)
     new_bic, new_val = new_held[:BIC_VAL_PER_CLASS], new_held[BIC_VAL_PER_CLASS:]
 
     train_loader = _loader(
         ex_train + new_train, ex_train_lbl + [new_label] * len(new_train),
-        label_to_idx, n_mels, augment=True, shuffle=True,
+        label_to_idx, n_mels, augment=True, shuffle=True, generator=dataloader_generator(seed),
     )
     bic_loader = _loader(
         ex_bic + new_bic, ex_bic_lbl + [new_label] * len(new_bic),
@@ -130,7 +137,9 @@ def evaluate(model: WhisperCommandClassifier, loader: DataLoader, device: torch.
         pooled = model.pooled_features(mels, n_frames)
         logits = model.classifier(pooled)
         if teacher_head is not None:
-            loss, _, _ = icarl_distillation_loss(logits, teacher_head(pooled), label_idxs, n_old)
+            loss, _, _, _ = icarl_distillation_loss(
+                logits, teacher_head(pooled), label_idxs, n_old, REPLAY_CE_WEIGHT
+            )
             loss_sum += loss.item()
 
         hit = logits.argmax(1) == label_idxs
@@ -169,7 +178,7 @@ def train_distillation(model: WhisperCommandClassifier, teacher_head: torch.nn.M
     for epoch in range(epochs):
         # --- Train ---
         model.train()
-        t_loss = t_distill = t_class = 0.0
+        t_loss = t_distill = t_class = t_replay = 0.0
         t_correct = t_total = 0
         for mels, label_idxs, n_frames in train_loader:
             mels = mels.to(device)
@@ -184,13 +193,16 @@ def train_distillation(model: WhisperCommandClassifier, teacher_head: torch.nn.M
             with torch.no_grad():
                 teacher_logits = teacher_head(pooled)
 
-            loss, distill, classification = icarl_distillation_loss(logits, teacher_logits, label_idxs, n_old)
+            loss, distill, classification, replay = icarl_distillation_loss(
+                logits, teacher_logits, label_idxs, n_old, REPLAY_CE_WEIGHT
+            )
             loss.backward()
             optimizer.step()
 
             t_loss += loss.item()
             t_distill += distill.item()
             t_class += classification.item()
+            t_replay += replay.item()
             t_correct += (logits.argmax(1) == label_idxs).sum().item()
             t_total += label_idxs.size(0)
 
@@ -199,9 +211,10 @@ def train_distillation(model: WhisperCommandClassifier, teacher_head: torch.nn.M
 
         n_batches = len(train_loader)
         logger.info(
-            "Epoch %02d/%02d | Train %.4f (d %.4f / c %.4f) / %.1f%% | Val %.4f / %.1f%% | new-cls %s | old-cls %s",
+            "Epoch %02d/%02d | Train %.4f (d %.4f / c %.4f / r %.4f) / %.1f%% | Val %.4f / %.1f%% | new-cls %s | old-cls %s",
             epoch + 1, epochs,
-            t_loss / n_batches, t_distill / n_batches, t_class / n_batches, 100 * t_correct / t_total,
+            t_loss / n_batches, t_distill / n_batches, t_class / n_batches, t_replay / n_batches,
+            100 * t_correct / t_total,
             val["loss"], val["acc"], _pct(val["new_acc"]), _pct(val["old_acc"]),
         )
 
@@ -210,12 +223,14 @@ def train_distillation(model: WhisperCommandClassifier, teacher_head: torch.nn.M
             save_checkpoint(
                 checkpoint_path, model, label_to_idx, idx_to_label,
                 whisper_model_name, freeze_encoder, val["acc"], epoch + 1,
+                seed=SEED,
             )
             logger.info("  → Best checkpoint saved (val_acc=%.1f%%)", val["acc"])
 
     save_checkpoint(
         le_path, model, label_to_idx, idx_to_label,
         whisper_model_name, freeze_encoder, val["acc"], epochs,
+        seed=SEED,
     )
     logger.info("  → Last-epoch checkpoint saved → %s (val_acc=%.1f%%)", le_path, val["acc"])
     logger.info("Stage 1 complete. Best val accuracy: %.1f%%", best_val_acc)
@@ -262,6 +277,7 @@ def apply_bias_correction(model: WhisperCommandClassifier, checkpoint_path: str,
         whisper_model_name, freeze_encoder, after["acc"], extras["epoch"],
         exemplars=exemplars,
         bias_correction={"alpha": alpha, "beta": beta, "n_old": n_old, "folded": True},
+        seed=extras["seed"],
     )
 
 
@@ -333,11 +349,12 @@ def main() -> None:
     # 8. Build the three disjoint splits
     new_files, _ = collect_files(new_label, data_dir)
     train_loader, bic_loader, val_loader = build_loaders(
-        exemplars, new_label, new_files, data_dir, label_to_idx, model.n_mels
+        exemplars, new_label, new_files, data_dir, label_to_idx, model.n_mels, SEED
     )
 
     # 9. Stage 1: distillation + replay
-    logger.info("Training '%s' for %d epochs with iCaRL distillation → %s", new_label, epochs, checkpoint_out)
+    logger.info("Training '%s' for %d epochs with distillation + replay (CE weight %.2f) → %s",
+                new_label, epochs, REPLAY_CE_WEIGHT, checkpoint_out)
     train_distillation(
         model, teacher_head, train_loader, val_loader, device,
         epochs, n_old, checkpoint_out, le_path,

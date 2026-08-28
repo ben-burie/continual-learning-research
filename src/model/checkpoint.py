@@ -9,7 +9,8 @@ logger = logging.getLogger(__name__)
 
 def save_checkpoint(path: str, model: WhisperCommandClassifier, label_to_idx: dict, idx_to_label: dict, whisper_model_name: str, freeze_encoder: bool, val_acc: float,
     epoch: int, fisher: dict | None = None, theta_star: dict | None = None,
-    exemplars: dict | None = None, bias_correction: dict | None = None) -> None:
+    exemplars: dict | None = None, bias_correction: dict | None = None,
+    seed: int | None = None) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     if freeze_encoder:
         state = {"classifier_state_dict": model.classifier.state_dict()}
@@ -31,6 +32,9 @@ def save_checkpoint(path: str, model: WhisperCommandClassifier, label_to_idx: di
             "theta_star": theta_star,
             "exemplars": exemplars,
             "bias_correction": bias_correction,
+            # Recorded so a sweep's results can be traced back to the run that produced
+            # them rather than to whatever the source constant happened to say.
+            "seed": seed,
         },
         path,
     )
@@ -49,6 +53,7 @@ def load_checkpoint_extras(checkpoint_path: str) -> dict:
         "bias_correction": ckpt.get("bias_correction"),
         "val_acc": ckpt.get("val_acc"),
         "epoch": ckpt.get("epoch"),
+        "seed": ckpt.get("seed"),
     }
 
 

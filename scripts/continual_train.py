@@ -15,7 +15,7 @@ from src.model.checkpoint import load_checkpoint, save_checkpoint
 from src.model.classifier import WhisperCommandClassifier
 from src.training.dataset import CommandDataset
 from src.training.trainer import configure_head_training
-from src.utils.seed import set_seed
+from src.utils.seed import dataloader_generator, resolve_seed, set_seed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ N_SAMPLES = 150
 BATCH_SIZE = 8
 LR = 1e-3
 HEAD_DROPOUT = None
-SEED = 0
+SEED = resolve_seed()
 OLD_VAL_SAMPLES_PER_CLASS = 15
 TRAIN_HIDDEN_LAYER = False
 
@@ -151,9 +151,12 @@ def collect_old_val_files(label_to_idx: dict, new_label: str, data_dir: Path, pe
 
 
 def build_dataloaders(file_paths: list[str], labels: list[str], label_to_idx: dict, n_mels: int,
-                      extra_val_paths: list[str] | None = None, extra_val_labels: list[str] | None = None) -> tuple[DataLoader, DataLoader]:
+                      extra_val_paths: list[str] | None = None, extra_val_labels: list[str] | None = None,
+                      seed: int = SEED) -> tuple[DataLoader, DataLoader]:
+    # The split and the shuffle order both come from `seed`; they were pinned to 42 and
+    # to the global RNG, which made a seed sweep re-run on identical data.
     train_paths, val_paths, train_labels, val_labels = train_test_split(
-        file_paths, labels, test_size=0.2, random_state=42, stratify=labels
+        file_paths, labels, test_size=0.2, random_state=seed, stratify=labels
     )
     # Old-class clips only pad the validation set — training stays new-class-only by design.
     if extra_val_paths:
@@ -161,7 +164,8 @@ def build_dataloaders(file_paths: list[str], labels: list[str], label_to_idx: di
         val_labels = val_labels + extra_val_labels
     train_ds = CommandDataset(train_paths, train_labels, label_to_idx, n_mels, augment=True)
     val_ds = CommandDataset(val_paths, val_labels, label_to_idx, n_mels, augment=False)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0,
+                              generator=dataloader_generator(seed))
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
     return train_loader, val_loader
 
@@ -250,6 +254,7 @@ def train_continual(model: WhisperCommandClassifier, train_loader: DataLoader, v
             save_checkpoint(
                 checkpoint_path, model, label_to_idx, idx_to_label,
                 whisper_model_name, freeze_encoder, v_acc, epoch + 1,
+                seed=SEED,
             )
             saved_any = True
             logger.info("  → Best checkpoint saved (val_acc=%.1f%%)", v_acc)
@@ -258,6 +263,7 @@ def train_continual(model: WhisperCommandClassifier, train_loader: DataLoader, v
             save_checkpoint(
                 checkpoint_path, model, label_to_idx, idx_to_label,
                 whisper_model_name, freeze_encoder, v_acc, epoch + 1,
+                seed=SEED,
             )
             saved_any = True
             logger.info("  → Final-epoch checkpoint saved as fallback (val_acc=%.1f%%)", v_acc)
@@ -324,7 +330,7 @@ def main() -> None:
         logger.warning("No old-class data found — validation measures the new class only.")
     train_loader, val_loader = build_dataloaders(
         file_paths, labels, label_to_idx, model.n_mels,
-        extra_val_paths=old_val_paths, extra_val_labels=old_val_labels,
+        extra_val_paths=old_val_paths, extra_val_labels=old_val_labels, seed=SEED,
     )
     logger.info("Train: %d  Val: %d", len(train_loader.dataset), len(val_loader.dataset))
 
