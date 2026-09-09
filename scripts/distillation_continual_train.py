@@ -41,6 +41,7 @@ BIC_LR = 1e-3
 
 BIC_MODE_SCALAR = "scalar"
 BIC_MODE_VECTOR = "vector"
+BIC_MODE_VECTOR_ALPHA = "vector_alpha"
 
 
 # ---------------------------------------------------------------------------
@@ -59,13 +60,16 @@ def prompt_bias_correction_mode() -> str:
     print("\nBias correction mode:")
     print("  [1] Traditional BiC — scalar α/β on the new-class logits")
     print("  [2] Bias-only vector scaling — one additive offset per class")
+    print("  [3] Vector scaling with a shared α — α·logits + b, α over every class")
     while True:
         choice = input("Selection [1]: ").strip() or "1"
         if choice == "1":
             return BIC_MODE_SCALAR
         if choice == "2":
             return BIC_MODE_VECTOR
-        print("Please enter 1 or 2.")
+        if choice == "3":
+            return BIC_MODE_VECTOR_ALPHA
+        print("Please enter 1, 2 or 3.")
 
 
 def prompt_training_config() -> tuple[str, int, str]:
@@ -282,7 +286,7 @@ def apply_bias_correction(model: WhisperCommandClassifier, checkpoint_path: str,
                           exemplars: dict, mode: str = BIC_MODE_SCALAR) -> None:
     """Fit the calibration on the held-out balanced set, fold it into the head, and re-save.
 
-    Both modes leave the network an ordinary classifier, so the choice is invisible to
+    All three modes leave the network an ordinary classifier, so the choice is invisible to
     everything downstream; it is recorded in the checkpoint only so a result can be traced
     back to the arm that produced it.
     """
@@ -292,11 +296,16 @@ def apply_bias_correction(model: WhisperCommandClassifier, checkpoint_path: str,
 
     before = evaluate(model, val_loader, device, n_old)
 
-    if mode == BIC_MODE_VECTOR:
-        bias_vector = fit_bias_vector(model, bic_loader, len(label_to_idx), device, BIC_EPOCHS, BIC_LR)
-        fold_bias_vector(model, bias_vector)
-        correction = {"mode": BIC_MODE_VECTOR, "bias": bias_vector, "n_old": n_old, "folded": True}
-        summary = "  b | " + _format_bias_vector(bias_vector, idx_to_label)
+    if mode in (BIC_MODE_VECTOR, BIC_MODE_VECTOR_ALPHA):
+        fit_alpha = mode == BIC_MODE_VECTOR_ALPHA
+        alpha, bias_vector = fit_bias_vector(model, bic_loader, len(label_to_idx), device,
+                                             BIC_EPOCHS, BIC_LR, fit_alpha=fit_alpha)
+        fold_bias_vector(model, bias_vector, alpha)
+        # α is recorded either way — it is 1.0 in bias-only mode, which makes the stored
+        # transform readable without having to know which mode wrote it.
+        correction = {"mode": mode, "alpha": alpha, "bias": bias_vector, "n_old": n_old, "folded": True}
+        summary = ("  " + (f"α={alpha:.4f}  " if fit_alpha else "")
+                   + "b | " + _format_bias_vector(bias_vector, idx_to_label))
     else:
         alpha, beta = fit_bias_correction(model, bic_loader, n_old, device, BIC_EPOCHS, BIC_LR)
         fold_bias_correction(model, alpha, beta, n_old)

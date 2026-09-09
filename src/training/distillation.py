@@ -155,15 +155,31 @@ def fold_bias_correction(model, alpha: float, beta: float, n_old: int) -> None:
 
 
 def fit_bias_vector(model, loader, n_classes: int, device, epochs: int = 200,
-                    lr: float = 1e-3) -> list[float]:
+                    lr: float = 1e-3, fit_alpha: bool = False) -> tuple[float, list[float]]:
     """Bias-only vector scaling: one additive offset per class, fit on the same balanced set.
 
-    q = o + b with b in R^n_classes, under softmax cross-entropy and with the rest of the
-    network frozen. Where fit_bias_correction rescales only the new-class logits and leaves
-    the old ones untouched, this gives every class — old and new — its own offset, so the
-    correction can also push down an old class the new one is being confused with. It buys
-    that with strictly less power in another direction: nothing here rescales a logit, so
-    the decision boundaries shift but never change orientation.
+    q = α·o + b with b in R^n_classes, under softmax cross-entropy and with the rest of the
+    network frozen. α is pinned at 1 unless fit_alpha is set — that is the bias-only case.
+    Where fit_bias_correction rescales only the new-class logits and leaves the old ones
+    untouched, this gives every class — old and new — its own offset, so the correction can
+    also push down an old class the new one is being confused with. It buys that with
+    strictly less power in another direction: no *class* gets its own scale, so the decision
+    boundaries shift but never change orientation.
+
+    What the shared α does, and does not, do. For α > 0,
+    argmax(α·o + b) == argmax(o + b/α), so it adds no decision rule the bias-only fit could
+    not already express: the two are the same family, reparameterised. It earns its place
+    anyway, for two reasons. It is a temperature, so it rescales every confidence the model
+    reports — the eval CSV's, and sigmoid(teacher_logits) at the next increment, where
+    absolute logit level does matter. And under a fixed step budget it changes what is
+    *reachable*: α and b travel together, and the effective offset b/α can end up larger
+    than anything b reaches alone in the same number of steps. Measured on a synthetic
+    4-class head at the committed 200 epochs, the new class's effective offset came out
+    -0.093 with α fit (α settled at 1.46) against -0.068 without. See
+    _warn_if_unconverged for why that ceiling binds at all.
+
+    α ≤ 0 inverts the ranking of every class at once, so it is warned about the same way
+    fit_bias_correction warns about its own.
 
     Softmax is invariant to a constant added to every logit, so b is only identified up to
     that constant: the cross-entropy gradient w.r.t. b sums to zero across classes, and
@@ -180,25 +196,31 @@ def fit_bias_vector(model, loader, n_classes: int, device, epochs: int = 200,
     cached = _cache_logits(model, loader, device)
 
     if not cached:
-        logger.warning("Bias-correction set was empty — leaving logits uncorrected (b=0).")
-        return [0.0] * n_classes
+        logger.warning("Bias-correction set was empty — leaving logits uncorrected (α=1, b=0).")
+        return 1.0, [0.0] * n_classes
 
     n_logits = cached[0][0].shape[1]
     if n_logits != n_classes:
         raise ValueError(f"n_classes={n_classes} but the head emits {n_logits} logits")
 
     bias = torch.zeros(n_classes, device=device, requires_grad=True)
-    optimizer = torch.optim.AdamW([bias], lr=lr, weight_decay=0.0)
+    alpha = torch.ones(1, device=device, requires_grad=fit_alpha)
+    optimizer = torch.optim.AdamW([bias, alpha] if fit_alpha else [bias], lr=lr, weight_decay=0.0)
 
-    initial = torch.zeros(n_classes)
+    # α and b are fit jointly, so convergence has to be judged on both together.
+    def trajectory() -> torch.Tensor:
+        parts = [bias.detach().cpu()] + ([alpha.detach().cpu()] if fit_alpha else [])
+        return torch.cat(parts)
+
+    initial = torch.cat([torch.zeros(n_classes)] + ([torch.ones(1)] if fit_alpha else []))
     late = initial.clone()
 
     for epoch in range(epochs):
         if epoch == int(0.9 * epochs):
-            late = bias.detach().cpu().clone()
+            late = trajectory()
         total = 0.0
         for logits, label_idxs in cached:
-            loss = F.cross_entropy(logits + bias, label_idxs)
+            loss = F.cross_entropy(alpha * logits + bias, label_idxs)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -207,27 +229,38 @@ def fit_bias_vector(model, loader, n_classes: int, device, epochs: int = 200,
         if (epoch + 1) % 50 == 0:
             # Centred, so these lines agree with the vector this eventually returns.
             shown = bias.detach() - bias.detach().mean()
-            logger.info("  bias-vector epoch %3d/%d | loss %.4f | b=[%s]",
-                        epoch + 1, epochs, total / len(cached),
+            logger.info("  bias-vector epoch %3d/%d | loss %.4f | α=%.4f | b=[%s]",
+                        epoch + 1, epochs, total / len(cached), alpha.item(),
                         ", ".join(f"{v:+.3f}" for v in shown.tolist()))
 
-    _warn_if_unconverged("bias vector", initial, late, bias.detach().cpu())
+    _warn_if_unconverged("bias vector", initial, late, trajectory())
     # Re-centring is a no-op for softmax, so it is applied after the convergence check
     # rather than before — the check should see the distance the fit actually travelled.
     centred = (bias.detach().cpu() - bias.detach().mean().cpu()).tolist()
-    return [float(v) for v in centred]
+    alpha = float(alpha.item())
+    if fit_alpha and alpha <= 0:
+        logger.warning("Bias vector fitted α=%.4f (≤ 0) — this inverts the ranking of every "
+                       "class at once; the fitting set is likely too small.", alpha)
+    return alpha, [float(v) for v in centred]
 
 
 @torch.no_grad()
-def fold_bias_vector(model, bias_vector: list[float]) -> None:
-    """Absorb the per-class offsets into the output layer's bias.
+def fold_bias_vector(model, bias_vector: list[float], alpha: float = 1.0) -> None:
+    """Absorb the per-class offsets, and any shared α, into the output layer.
 
-    (w_k·f + b_k) + v_k == w_k·f + (b_k + v_k), so — exactly as with fold_bias_correction —
-    the corrected network stays an ordinary classifier and nothing downstream needs to know
-    a correction was applied.
+    α·(w_k·f + b_k) + v_k == (α·w_k)·f + (α·b_k + v_k), so — exactly as with
+    fold_bias_correction — the corrected network stays an ordinary classifier and nothing
+    downstream needs to know a correction was applied. Unlike fold_bias_correction, α here
+    scales *every* row, old classes included: it is a temperature on the whole head, not a
+    reweighting of the new class against the old ones.
+
+    α = 1.0, the bias-only default, leaves the weights untouched and reduces this to
+    out.bias += v.
     """
     out = model.output_layer
     v = torch.as_tensor(bias_vector, dtype=out.bias.dtype, device=out.bias.device)
     if v.numel() != out.bias.numel():
         raise ValueError(f"bias vector has {v.numel()} entries but the head has {out.bias.numel()} classes")
-    out.bias += v
+    if alpha != 1.0:
+        out.weight *= alpha
+    out.bias.copy_(out.bias * alpha + v)
