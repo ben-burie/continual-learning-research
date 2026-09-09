@@ -15,7 +15,17 @@ try:
 except ImportError:
     _LIBROSA = False
 
+import torch
+
 from bark import SAMPLE_RATE, generate_audio, preload_models
+
+_torch_load = torch.load
+
+def _torch_load_unsafe(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return _torch_load(*args, **kwargs)
+
+torch.load = _torch_load_unsafe
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
