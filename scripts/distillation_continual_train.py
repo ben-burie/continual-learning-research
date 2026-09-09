@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.model.checkpoint import load_checkpoint, load_checkpoint_extras, save_checkpoint
 from src.model.classifier import WhisperCommandClassifier
 from src.training.dataset import CommandDataset
-from src.training.distillation import fit_bias_correction, fold_bias_correction, icarl_distillation_loss
+from src.training.distillation import (fit_bias_correction, fit_bias_vector, fold_bias_correction,
+                                       fold_bias_vector, icarl_distillation_loss)
 from src.training.exemplars import partition_old_classes, resolve_exemplars, select_exemplars_herding
 from src.training.trainer import configure_head_training
 from src.utils.seed import dataloader_generator, resolve_seed, set_seed
@@ -38,6 +39,9 @@ OLD_VAL_SAMPLES_PER_CLASS = 15
 BIC_EPOCHS = 200
 BIC_LR = 1e-3
 
+BIC_MODE_SCALAR = "scalar"
+BIC_MODE_VECTOR = "vector"
+
 
 # ---------------------------------------------------------------------------
 # Interactive prompts
@@ -51,7 +55,20 @@ def prompt_new_command() -> str:
     return label
 
 
-def prompt_training_config() -> tuple[str, int]:
+def prompt_bias_correction_mode() -> str:
+    print("\nBias correction mode:")
+    print("  [1] Traditional BiC — scalar α/β on the new-class logits")
+    print("  [2] Bias-only vector scaling — one additive offset per class")
+    while True:
+        choice = input("Selection [1]: ").strip() or "1"
+        if choice == "1":
+            return BIC_MODE_SCALAR
+        if choice == "2":
+            return BIC_MODE_VECTOR
+        print("Please enter 1 or 2.")
+
+
+def prompt_training_config() -> tuple[str, int, str]:
     model_name = input("\nEnter name for the new checkpoint: ").strip()
     while True:
         try:
@@ -59,7 +76,8 @@ def prompt_training_config() -> tuple[str, int]:
             break
         except ValueError:
             print("Please enter a valid number.")
-    return model_name, epochs
+    bic_mode = prompt_bias_correction_mode()
+    return model_name, epochs, bic_mode
 
 
 # ---------------------------------------------------------------------------
@@ -254,21 +272,40 @@ def reload_head(model: WhisperCommandClassifier, checkpoint_path: str, device: t
     model.to(device)
 
 
+def _format_bias_vector(bias_vector: list[float], idx_to_label: dict) -> str:
+    return "  ".join(f"{idx_to_label.get(i, i)}={v:+.4f}" for i, v in enumerate(bias_vector))
+
+
 def apply_bias_correction(model: WhisperCommandClassifier, checkpoint_path: str, bic_loader: DataLoader,
                           val_loader: DataLoader, device: torch.device, n_old: int, label_to_idx: dict,
                           idx_to_label: dict, whisper_model_name: str, freeze_encoder: bool,
-                          exemplars: dict) -> None:
-    """Fit α/β on the held-out balanced set, fold them into the head, and re-save."""
-    logger.info("--- BiC stage 2: %s ---", checkpoint_path)
+                          exemplars: dict, mode: str = BIC_MODE_SCALAR) -> None:
+    """Fit the calibration on the held-out balanced set, fold it into the head, and re-save.
+
+    Both modes leave the network an ordinary classifier, so the choice is invisible to
+    everything downstream; it is recorded in the checkpoint only so a result can be traced
+    back to the arm that produced it.
+    """
+    logger.info("--- BiC stage 2 (%s): %s ---", mode, checkpoint_path)
     reload_head(model, checkpoint_path, device)
     extras = load_checkpoint_extras(checkpoint_path)
 
     before = evaluate(model, val_loader, device, n_old)
-    alpha, beta = fit_bias_correction(model, bic_loader, n_old, device, BIC_EPOCHS, BIC_LR)
-    fold_bias_correction(model, alpha, beta, n_old)
+
+    if mode == BIC_MODE_VECTOR:
+        bias_vector = fit_bias_vector(model, bic_loader, len(label_to_idx), device, BIC_EPOCHS, BIC_LR)
+        fold_bias_vector(model, bias_vector)
+        correction = {"mode": BIC_MODE_VECTOR, "bias": bias_vector, "n_old": n_old, "folded": True}
+        summary = "  b | " + _format_bias_vector(bias_vector, idx_to_label)
+    else:
+        alpha, beta = fit_bias_correction(model, bic_loader, n_old, device, BIC_EPOCHS, BIC_LR)
+        fold_bias_correction(model, alpha, beta, n_old)
+        correction = {"mode": BIC_MODE_SCALAR, "alpha": alpha, "beta": beta, "n_old": n_old, "folded": True}
+        summary = f"  α={alpha:.4f}  β={beta:.4f}"
+
     after = evaluate(model, val_loader, device, n_old)
 
-    logger.info("  α=%.4f  β=%.4f", alpha, beta)
+    logger.info("%s", summary)
     logger.info("  Val before | %.1f%% (new %s / old %s)", before["acc"], _pct(before["new_acc"]), _pct(before["old_acc"]))
     logger.info("  Val after  | %.1f%% (new %s / old %s)", after["acc"], _pct(after["new_acc"]), _pct(after["old_acc"]))
 
@@ -276,7 +313,7 @@ def apply_bias_correction(model: WhisperCommandClassifier, checkpoint_path: str,
         checkpoint_path, model, label_to_idx, idx_to_label,
         whisper_model_name, freeze_encoder, after["acc"], extras["epoch"],
         exemplars=exemplars,
-        bias_correction={"alpha": alpha, "beta": beta, "n_old": n_old, "folded": True},
+        bias_correction=correction,
         seed=extras["seed"],
     )
 
@@ -307,9 +344,10 @@ def main() -> None:
         logger.error("Label '%s' already exists in this checkpoint. Aborting.", new_label)
         sys.exit(1)
 
-    model_name, epochs = prompt_training_config()
+    model_name, epochs, bic_mode = prompt_training_config()
     checkpoint_out = f"models/{date.today()}_{model_name}.pth"
     le_path = str(Path(checkpoint_out).with_name(f"{Path(checkpoint_out).stem}_LE.pth"))
+    logger.info("Bias correction mode: %s", bic_mode)
 
     # 3. Generate data unless the label directory already exists
     label_dir = data_dir / new_label
@@ -374,6 +412,7 @@ def main() -> None:
         apply_bias_correction(
             model, path, bic_loader, val_loader, device, n_old,
             label_to_idx, idx_to_label, whisper_model_name, base_freeze_encoder, exemplars,
+            mode=bic_mode,
         )
 
     logger.info("Done. Checkpoints: %s and %s", checkpoint_out, le_path)
