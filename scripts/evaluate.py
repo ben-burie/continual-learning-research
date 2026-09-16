@@ -1,3 +1,4 @@
+import argparse
 import csv
 import logging
 import sys
@@ -33,6 +34,77 @@ def prompt_test_dir() -> Path:
     name = input("Test data directory (e.g. test_data): ").strip()
     return Path(name)
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="evaluate",
+        description="Evaluate a checkpoint against a directory of labelled test audio. "
+                    "Options omitted here are prompted for interactively.",
+    )
+    parser.add_argument("--checkpoint", metavar="PATH",
+                        help="Path to the checkpoint, including models/ (e.g. models/BASE.pth). "
+                             "The interactive prompt asks for a bare name under models/; this "
+                             "takes a full path so a sweep can point anywhere.")
+    parser.add_argument("--test-dir", metavar="DIR",
+                        help="Directory holding one <label>/ subdirectory of .wav files per "
+                             "class (e.g. test_data_4). Its labels must match the checkpoint's "
+                             "exactly.")
+    parser.add_argument("--summary-csv", metavar="PATH",
+                        help="Append one row for this model — overall and per-class accuracy — "
+                             "to a shared CSV, creating it if needed. Use the same path across a "
+                             "sweep to collect every arm in one table.")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress the per-file result table and print only the summary. "
+                             "Per-file detail still goes to the CSV.")
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    for name in ("checkpoint", "test_dir", "summary_csv"):
+        value = getattr(args, name)
+        if value is not None:
+            value = value.strip()
+            if not value:
+                parser.error(f"--{name.replace('_', '-')} cannot be empty.")
+            setattr(args, name, value)
+    return args
+
+
+def append_summary_row(summary_path: Path, checkpoint_path: Path, seed_tag: str, correct: int,
+                       total: int, per_class_total: dict[str, int],
+                       per_class_correct: dict[str, int]) -> None:
+    row = {
+        "model": checkpoint_path.stem,
+        "seed": seed_tag,
+        "overall_accuracy": f"{correct / total:.4f}" if total else "",
+        "correct": correct,
+        "total": total,
+    }
+    for label in sorted(per_class_total):
+        n = per_class_total[label]
+        row[f"acc_{label}"] = f"{per_class_correct[label] / n:.4f}" if n else ""
+    fieldnames = list(row)
+
+    existing: list[str] = []
+    if summary_path.exists():
+        with open(summary_path, newline="") as f:
+            existing = next(csv.reader(f), [])
+    if existing and existing != fieldnames:
+        logger.error("Summary CSV %s has columns %s, but this checkpoint needs %s — not "
+                     "appending. Move the old file aside, or point --summary-csv elsewhere.",
+                     summary_path, existing, fieldnames)
+        return
+
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not existing:
+            writer.writeheader()
+        writer.writerow(row)
+    logger.info("Summary row appended -> %s", summary_path)
+
+
 def _scan_test_dir(test_dir: Path) -> dict[str, list[Path]]:
     """Return {label: [wav_path, ...]} for all subdirectories containing .wav files."""
     result = {}
@@ -44,9 +116,10 @@ def _scan_test_dir(test_dir: Path) -> dict[str, list[Path]]:
             result[subdir.name] = wavs
     return result
 
-def main() -> None:
-    checkpoint_path = prompt_checkpoint()
-    test_dir = prompt_test_dir()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    checkpoint_path = Path(args.checkpoint) if args.checkpoint else prompt_checkpoint()
+    test_dir = Path(args.test_dir) if args.test_dir else prompt_test_dir()
 
     if not checkpoint_path.exists():
         logger.error("Checkpoint not found: %s", checkpoint_path)
@@ -143,16 +216,18 @@ def main() -> None:
     total = 0
     correct = 0
 
-    print()
-    print(f"{'FILE':<45} {'ACTUAL':<25} {'PREDICTED':<25} {'CONF':>6}  {'':>6}")
-    print("-" * 115)
+    if not args.quiet:
+        print()
+        print(f"{'FILE':<45} {'ACTUAL':<25} {'PREDICTED':<25} {'CONF':>6}  {'':>6}")
+        print("-" * 115)
 
     for wav_path, actual_label, pred_label, conf in zip(
         all_wav_paths, all_actual_labels, all_pred_labels, all_confidences
     ):
         is_correct = pred_label == actual_label
-        indicator = "[PASS]" if is_correct else "[FAIL]"
-        print(f"{wav_path.name:<45} {actual_label:<25} {pred_label:<25} {conf:>6.1%}  {indicator}")
+        if not args.quiet:
+            indicator = "[PASS]" if is_correct else "[FAIL]"
+            print(f"{wav_path.name:<45} {actual_label:<25} {pred_label:<25} {conf:>6.1%}  {indicator}")
 
         rows.append({
             "seed": seed_tag,
@@ -181,6 +256,10 @@ def main() -> None:
         c = per_class_correct[label]
         print(f"{label:<30} {c:>8} {n:>8} {c/n:>10.1%} {1/n:>10.2%}")
     print("=" * 72)
+
+    if args.summary_csv:
+        append_summary_row(Path(args.summary_csv), checkpoint_path, seed_tag,
+                           correct, total, per_class_total, per_class_correct)
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["seed", "file", "actual_label", "predicted_label", "confidence", "correct"])

@@ -1,3 +1,4 @@
+import argparse
 import copy
 import logging
 import random
@@ -18,7 +19,7 @@ from src.training.distillation import (fit_bias_correction, fit_bias_vector, fol
                                        fold_bias_vector, icarl_distillation_loss)
 from src.training.exemplars import partition_old_classes, resolve_exemplars, select_exemplars_herding
 from src.training.trainer import configure_head_training
-from src.utils.seed import dataloader_generator, resolve_seed, set_seed
+from src.utils.seed import SEED_ENV_VAR, dataloader_generator, resolve_seed, set_seed
 from scripts.continual_train import (BATCH_SIZE, LR, collect_files, expand_classifier, run_data_generation)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
@@ -72,15 +73,74 @@ def prompt_bias_correction_mode() -> str:
         print("Please enter 1, 2 or 3.")
 
 
-def prompt_training_config() -> tuple[str, int, str]:
+def prompt_model_name() -> str:
     model_name = input("\nEnter name for the new checkpoint: ").strip()
+    while not model_name:
+        model_name = input("Name cannot be empty. Checkpoint name: ").strip()
+    return model_name
+
+
+def prompt_epochs() -> int:
     while True:
         try:
             epochs = int(input("Number of epochs: "))
-            break
         except ValueError:
             print("Please enter a valid number.")
-    bic_mode = prompt_bias_correction_mode()
+            continue
+        if epochs >= 1:
+            return epochs
+        print("Must be at least 1.")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="distillation_continual_train",
+        description="Continual training with distillation + exemplar replay + bias correction. "
+                    "Options omitted here are prompted for interactively.",
+    )
+    parser.add_argument("--label", metavar="KEY",
+                        help="Label key for the new command (e.g. Open_Spotify).")
+    parser.add_argument("--model-name", metavar="NAME",
+                        help="Name for the new checkpoint, saved as models/<date>_<NAME>.pth.")
+    parser.add_argument("--epochs", type=int, metavar="N",
+                        help="Stage-1 distillation epochs.")
+    parser.add_argument("--bic-mode", choices=(BIC_MODE_SCALAR, BIC_MODE_VECTOR, BIC_MODE_VECTOR_ALPHA),
+                        # ASCII only: --help is written to stdout, which is cp1252 under a
+                        # redirect on Windows and cannot encode the alpha/beta the prompts use.
+                        help=f"Stage-2 bias correction: '{BIC_MODE_SCALAR}' fits alpha/beta on the "
+                             f"new-class logits, '{BIC_MODE_VECTOR}' one offset per class, "
+                             f"'{BIC_MODE_VECTOR_ALPHA}' those offsets plus a shared alpha.")
+    parser.add_argument("--seed", type=int, default=SEED, metavar="N",
+                        help=f"Random seed, overriding ${SEED_ENV_VAR} (default: %(default)s).")
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # Validate here rather than on first use: a sweep should fail on the command line,
+    # not an hour into a run.
+    if args.label is not None:
+        args.label = args.label.strip()
+        if not args.label:
+            parser.error("--label cannot be empty.")
+    if args.model_name is not None:
+        args.model_name = args.model_name.strip()
+        if not args.model_name:
+            parser.error("--model-name cannot be empty.")
+    if args.epochs is not None and args.epochs < 1:
+        parser.error("--epochs must be at least 1.")
+    return args
+
+
+def resolve_training_config(args: argparse.Namespace) -> tuple[str, int, str]:
+    model_name = args.model_name or prompt_model_name()
+    epochs = args.epochs if args.epochs is not None else prompt_epochs()
+    bic_mode = args.bic_mode or prompt_bias_correction_mode()
     return model_name, epochs, bic_mode
 
 
@@ -96,15 +156,6 @@ def _loader(paths: list[str], labels: list[str], label_to_idx: dict, n_mels: int
 
 def build_loaders(exemplars: dict, new_label: str, new_files: list[str], data_dir: Path,
                   label_to_idx: dict, n_mels: int, seed: int) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """Partition everything three ways — see partition_old_classes for the old-class side.
-
-    The new class is split 80/20; the bias-correction clips are carved out of the val
-    side so they never touch stage-1 training.
-
-    Every split is drawn from `seed`. They used to be fixed - random_state=42 plus a
-    fixed slice of the herding order - which left a seed sweep re-training on
-    byte-identical data in every run.
-    """
     (ex_train, ex_train_lbl), (ex_bic, ex_bic_lbl), (old_val, old_val_lbl) = partition_old_classes(
         exemplars, data_dir, BIC_VAL_PER_CLASS, OLD_VAL_SAMPLES_PER_CLASS, rng=random.Random(seed)
     )
@@ -331,7 +382,13 @@ def apply_bias_correction(model: WhisperCommandClassifier, checkpoint_path: str,
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    global SEED
+
+    args = parse_args(argv)
+    # train_distillation reads SEED as a module global when it stamps a checkpoint, so the
+    # override has to land before anything reads it — i.e. before set_seed below.
+    SEED = args.seed
     set_seed(SEED)
     data_dir = Path("data")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -347,13 +404,13 @@ def main() -> None:
     n_old = len(old_labels)
     logger.info("Existing classes (%d): %s", n_old, old_labels)
 
-    # 2. Prompt for new command label and training config
-    new_label = prompt_new_command()
+    # 2. Resolve new command label and training config (flags first, prompts for the rest)
+    new_label = args.label or prompt_new_command()
     if new_label in label_to_idx:
         logger.error("Label '%s' already exists in this checkpoint. Aborting.", new_label)
         sys.exit(1)
 
-    model_name, epochs, bic_mode = prompt_training_config()
+    model_name, epochs, bic_mode = resolve_training_config(args)
     checkpoint_out = f"models/{date.today()}_{model_name}.pth"
     le_path = str(Path(checkpoint_out).with_name(f"{Path(checkpoint_out).stem}_LE.pth"))
     logger.info("Bias correction mode: %s", bic_mode)
