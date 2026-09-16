@@ -9,7 +9,7 @@ TRAIN_SCRIPT = "scripts/distillation_continual_train.py"
 EVAL_SCRIPT = "scripts/evaluate.py"
 
 LABEL = "Open_Amazon"
-EPOCHS = 20
+EPOCHS = 15
 TEST_DIR = "test_data_4"
 # One appended row per evaluated model, collecting every arm in one table.
 SUMMARY_CSV = "model_eval/master_summary.csv"
